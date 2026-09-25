@@ -8,6 +8,7 @@ from .greenwave import (
     compute_convoy_starts,
     compute_earliest_route,
     compute_max_coverage,
+    compute_min_discharge,
     compute_plan_switch_windows,
     compute_queue_forecast,
     compute_slot_offsets,
@@ -21,6 +22,8 @@ from .schemas import (
     EarliestRouteResponse,
     GreenWaveRequest,
     MaxCoverageResponse,
+    MinDischargeRequest,
+    MinDischargeResponse,
     OffsetDiagnosticsRequest,
     OffsetDiagnosticsResponse,
     OffsetInterval,
@@ -91,9 +94,17 @@ app = FastAPI(
         "（时刻、正整数车辆数，同秒可多批）。每秒先按输入顺序将到达批次"
         "入队，再判灯并按先到先走放行，红灯不放行；用批次计数推进队列，"
         "不逐辆展开。返回各批最后一辆的通过秒（范围内未全部通过为 null）、"
-        "期末待行车辆数与最大排队数（每秒到达后、放行前统计）。"
+        "期末待行车辆数与最大排队数（每秒到达后、放行前统计）。\n\n"
+        "放行能力测算接口 `POST /api/green-wave/min-discharge`：复用排队"
+        "预测的单路口信号、半开预测范围、期初队列与批次到达语义，每批另给"
+        "不早于到达秒且小于范围终点的含端点 deadline（该批最后一辆通过秒"
+        "须 <= deadline）。求最小正整数每绿灯秒放行量，使期初车辆与全部"
+        "批次在范围结束前清空且各批满足自身 deadline；同秒批次按输入顺序"
+        "先入队再放行，红灯不放行，跨零点与常绿判灯规则不变。通过按批计数"
+        "的可行性模拟与对放行量的单调二分搜索求解，返回最低放行量及该值下"
+        "按输入顺序的批次通过秒；即使无限放行能力仍无法满足时返回 null。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -352,4 +363,36 @@ def green_wave_queue_forecast(
         batch_pass_times=pass_times,
         final_queue=final_queue,
         max_queue=max_queue,
+    )
+
+
+@app.post(
+    "/api/green-wave/min-discharge",
+    response_model=MinDischargeResponse | None,
+    tags=["绿波"],
+    summary="放行能力测算：求满足清空与各批 deadline 的最小每绿灯秒放行量",
+)
+def green_wave_min_discharge(
+    request: MinDischargeRequest,
+) -> MinDischargeResponse | None:
+    request.validate_ranges()
+    result = compute_min_discharge(
+        cycle=request.cycle,
+        offset=request.offset,
+        green_start=request.green_start,
+        green_end=request.green_end,
+        forecast_from=request.forecast_from,
+        forecast_to=request.forecast_to,
+        initial_queue=request.initial_queue,
+        arrivals=(
+            (item.time, item.vehicles, item.deadline)
+            for item in request.arrivals
+        ),
+    )
+    if result is None:
+        return None
+    min_discharge, pass_times = result
+    return MinDischargeResponse(
+        min_discharge=min_discharge,
+        batch_pass_times=pass_times,
     )

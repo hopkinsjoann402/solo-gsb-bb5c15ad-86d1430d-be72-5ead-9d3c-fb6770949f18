@@ -146,6 +146,22 @@ headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)`
 批次），放行时整批或部分地扣减队首计数，**不逐辆展开**；某批剩余计数
 归零的秒即该批最后一辆的通过秒，范围内未全部通过的批次记 ``None``。
 返回 ``(各批最后通过秒列表, 期末待行车辆数, 最大排队数)``。
+
+路口放行能力测算
+----------------
+:func:`compute_min_discharge` 复用排队预测的**全部单路口语义**（信号、半开范围、
+期初队列、同秒批次按输入顺序先入队再放行、红灯不放行、跨零点与常绿判灯），区别
+仅在于每批另给一个**含端点** deadline（``到达秒 <= deadline < 范围终点``），且
+每绿灯秒放行量 d 不再是输入而是待求量：求使下述条件成立的**最小正整数** d——
+
+* 期初队列与全部批次在范围结束前清空（最后通过秒 < forecast_to）；
+* 每批最后一辆的通过秒不晚于自身 deadline（``pass_time <= deadline``）。
+
+可行性关于 d 单调（更大的每绿灯秒放行量只会让每辆车通过得更早），故先以
+``d = 车辆总数``（任何绿灯秒队列都不超过总数，等价于无限放行能力）判定是否
+有解，再在 ``[1, 车辆总数]`` 上二分；无解返回 ``None``。可行性模拟与排队预测
+同样用**批次计数**推进（不逐辆展开），并把无队列、无到达的空闲秒整段跳到
+"下一个到达秒或绿灯秒"，不逐秒空转。
 """
 
 from __future__ import annotations
@@ -1315,3 +1331,157 @@ def compute_queue_forecast(
                     waiting -= remaining
                     remaining = 0
     return pass_times, waiting, max_queue
+
+
+# ---------- 路口放行能力测算（min discharge） ----------
+
+
+def _discharge_feasible(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    forecast_from: int,
+    forecast_to: int,
+    discharge_per_second: int,
+    initial_queue: int,
+    batches: list[tuple[int, int, int]],
+) -> tuple[bool, list[int]]:
+    """按批次计数模拟给定放行量 d 下的可行性与各批通过秒。
+
+    逐秒语义与 :func:`compute_queue_forecast` 完全一致：每秒先把当秒到达批次
+    **按输入顺序**整体入队，再判灯，绿灯时按先到先走放行至多 d 辆，红灯不
+    放行。额外的 deadline 检查：某批计数归零（该批最后一辆通过）的秒若晚于
+    其 deadline，立即判定不可行。
+
+    无队列、无到达的空闲秒（典型为红灯等待）整段跳到"下一个到达秒或绿灯秒"，
+    不逐秒空转；跳到绿灯秒时该秒照常先入队当秒到达再放行，语义不变。
+
+    返回 ``(是否可行, 各批通过秒列表)``。不可行时通过秒列表无意义（仅用于
+    二分最终成功的那次取值）。
+    """
+    n_batches = len(batches)
+    by_second: dict[int, list[int]] = {}
+    for index, (moment, _count, _deadline) in enumerate(batches):
+        by_second.setdefault(moment, []).append(index)
+    arrival_seconds = sorted(by_second)
+
+    pass_times = [0] * n_batches
+    queue: deque[list[int]] = deque()  # 队首元素：[批次下标（期初为 -1）, 剩余辆数]
+    waiting = 0
+    if initial_queue:
+        queue.append([-1, initial_queue])
+        waiting = initial_queue
+
+    arrival_pos = 0
+    now = forecast_from
+    while now < forecast_to:
+        # 1) 当秒到达批次按输入顺序入队。
+        if arrival_pos < len(arrival_seconds) and arrival_seconds[arrival_pos] == now:
+            for index in by_second[now]:
+                queue.append([index, batches[index][1]])
+                waiting += batches[index][1]
+            arrival_pos += 1
+        # 2) 判灯放行：绿灯秒按先到先走放行至多 discharge_per_second 辆。
+        if waiting and is_green(cycle, offset, green_start, green_end, now):
+            remaining = discharge_per_second
+            while remaining and queue:
+                head = queue[0]
+                if head[1] <= remaining:
+                    remaining -= head[1]
+                    waiting -= head[1]
+                    if head[0] >= 0:
+                        index = head[0]
+                        if now > batches[index][2]:
+                            return False, pass_times  # 该批最后一辆晚于 deadline
+                        pass_times[index] = now
+                    queue.popleft()
+                else:
+                    head[1] -= remaining
+                    waiting -= remaining
+                    remaining = 0
+        # 3) 跳到下一个相关秒（下一个到达秒 / 队列尚有待放车辆时的下一绿灯
+        #    秒），跳过无车可放的红灯与无到达的空秒。当前绿灯秒放行后仍有
+        #    排队时，下一时刻可能仍为绿灯，next_green_departure(now+1) 会
+        #    直接返回 now+1，不会跳过可放行的绿灯秒。
+        candidates: list[int] = []
+        if arrival_pos < len(arrival_seconds):
+            candidates.append(arrival_seconds[arrival_pos])
+        if waiting:
+            candidates.append(
+                next_green_departure(
+                    cycle, offset, green_start, green_end, now + 1
+                )
+            )
+        if not candidates:
+            break  # 既无待放车辆也无后续到达：提前结束
+        now = min(candidates)
+    return waiting == 0, pass_times
+
+
+def compute_min_discharge(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    forecast_from: int,
+    forecast_to: int,
+    initial_queue: int,
+    arrivals: Iterable[tuple[int, int, int]],
+) -> tuple[int, list[int]] | None:
+    """求使期初车辆与全部批次在范围结束前、且各批不晚于自身 deadline 清空的
+    最小正整数每绿灯秒放行量。
+
+    信号参数（cycle / offset / green_start / green_end）的相位、半开绿灯、
+    跨零点与整周期常绿语义，以及半开预测范围 ``[forecast_from, forecast_to)``、
+    期初队列 ``initial_queue``（非负整数，先于一切批次、不产生 deadline）、
+    同秒批次按输入顺序**先入队再放行**、红灯不放行等逐秒语义，均与
+    :func:`compute_queue_forecast` 完全一致。
+
+    ``arrivals`` 为到达批次 ``(time, vehicles, deadline)`` 序列（vehicles 为
+    正整数；time 已请求侧保证落在预测范围内；deadline 为含端点约束，
+    ``time <= deadline < forecast_to``，即该批最后一辆的通过秒必须
+    ``<= deadline``）。
+
+    可行性关于每绿灯秒放行量 d 单调：把某绿灯秒的放行量增大只会让任何车辆
+    通过得更早或同时，故先以 ``d = 车辆总数``（该值下任一秒可一次性清空
+    队列，等价于无限放行能力）判定有解性，再在 ``[1, 车辆总数]`` 上二分最小
+    可行值。返回 ``(最小放行量, 该放行量下按输入顺序的各批通过秒列表)``；
+    车辆总数为 0 时无任何待放车辆，最小正整数放行量为 1、通过秒列表为空；
+    即使无限放行能力也无法清空（无任何可用绿灯秒，或某批 deadline 早于其
+    可能的最早通过秒）时返回 ``None``。
+
+    每次可行性检查用批次计数推进（不逐辆展开），二分层数
+    ``O(log(initial_queue + 各批车辆总数))``。
+    """
+    batches = list(arrivals)
+    total_vehicles = initial_queue + sum(count for _time, count, _dl in batches)
+    if total_vehicles == 0:
+        return 1, []
+
+    signal = (cycle, offset, green_start, green_end)
+    common = (forecast_from, forecast_to)
+
+    # 上界 = 车辆总数：任一绿灯秒队列长度不超过总数，故该值等价于无限放行
+    # 能力；此上界仍不可行则任何正整数放行量都不可行。
+    feasible, pass_times = _discharge_feasible(
+        *signal, *common, total_vehicles, initial_queue, batches
+    )
+    if not feasible:
+        return None
+
+    lo, hi = 1, total_vehicles
+    while lo < hi:
+        mid = (lo + hi) // 2
+        ok, _pass_times = _discharge_feasible(
+            *signal, *common, mid, initial_queue, batches
+        )
+        if ok:
+            hi = mid
+        else:
+            lo = mid + 1
+    # lo 已由上界可行性保证可行；重跑一次取得最小放行量下的通过秒。
+    _ok, pass_times = _discharge_feasible(
+        *signal, *common, lo, initial_queue, batches
+    )
+    return lo, pass_times
