@@ -6,6 +6,7 @@ from app.main import (
     green_wave_convoy_starts,
     green_wave_earliest_route,
     green_wave_max_coverage,
+    green_wave_min_discharge,
     green_wave_offset_diagnostics,
     green_wave_queue_forecast,
     green_wave_slot_offsets,
@@ -17,6 +18,7 @@ from app.schemas import (
     EarliestRouteRequest,
     GreenWaveRequest,
     Intersection,
+    MinDischargeRequest,
     OffsetDiagnosticsRequest,
     QueueForecastRequest,
     SlotOffsetsRequest,
@@ -1222,3 +1224,190 @@ def test_queue_forecast_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/queue-forecast" in paths
     assert "post" in paths["/api/green-wave/queue-forecast"]
+
+
+# ---------- POST /api/green-wave/min-discharge ----------
+
+
+def make_min_discharge_request(payload):
+    return MinDischargeRequest.model_validate(payload)
+
+
+def min_discharge_payload(**kw):
+    base = {
+        "forecast_from": 0,
+        "forecast_to": 60,
+        "cycle": 60,
+        "offset": 0,
+        "green_start": 0,
+        "green_end": 0,  # 常绿
+        "initial_queue": 0,
+        "arrivals": [],
+    }
+    base.update(kw)
+    return base
+
+
+def test_min_discharge_payload():
+    # 常绿：t=0 到 3 辆、deadline=4，d=1 时 t=0..2 走完；返回最低放行量 1
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            forecast_to=5,
+            arrivals=[{"time": 0, "vehicles": 3, "deadline": 4}],
+        )
+    )
+    resp = green_wave_min_discharge(req)
+    assert resp is not None
+    assert resp.min_discharge_per_second == 1
+    assert resp.batch_pass_times == [2]
+
+
+def test_min_discharge_tight_deadline_requires_capacity():
+    # t=0 到 4 辆、deadline=1：d=2 时 t=0、1 恰走完（含端点）
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            arrivals=[{"time": 0, "vehicles": 4, "deadline": 1}],
+        )
+    )
+    resp = green_wave_min_discharge(req)
+    assert resp is not None
+    assert resp.min_discharge_per_second == 2
+    assert resp.batch_pass_times == [1]
+
+
+def test_min_discharge_same_second_batches_input_order():
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            forecast_to=10,
+            arrivals=[
+                {"time": 0, "vehicles": 2, "deadline": 9},
+                {"time": 0, "vehicles": 1, "deadline": 1},
+            ],
+        )
+    )
+    resp = green_wave_min_discharge(req)
+    # d=2：第一批 t=0 走完、第二批 t=1 走完（恰为 deadline）
+    assert resp is not None
+    assert resp.min_discharge_per_second == 2
+    assert resp.batch_pass_times == [0, 1]
+
+
+def test_min_discharge_initial_queue_and_red_phase():
+    # 绿灯 [0,10)：期初 5 辆，t=0 起 10 个绿灯秒内须清空；d=1 即可
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            green_start=0,
+            green_end=10,
+            initial_queue=5,
+            arrivals=[],
+        )
+    )
+    resp = green_wave_min_discharge(req)
+    assert resp is not None
+    assert resp.min_discharge_per_second == 1
+    assert resp.batch_pass_times == []
+    # t=20 到达的批次在范围 [0,60) 内一直遇红：无解 null
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            green_start=0,
+            green_end=10,
+            arrivals=[{"time": 20, "vehicles": 1, "deadline": 59}],
+        )
+    )
+    assert green_wave_min_discharge(req) is None
+
+
+def test_min_discharge_no_vehicles_returns_one():
+    req = make_min_discharge_request(min_discharge_payload())
+    resp = green_wave_min_discharge(req)
+    assert resp is not None
+    assert resp.min_discharge_per_second == 1
+    assert resp.batch_pass_times == []
+
+
+def test_min_discharge_rejects_deadline_before_arrival():
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            arrivals=[{"time": 10, "vehicles": 1, "deadline": 9}],
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_min_discharge(req)
+    assert exc.value.status_code == 422
+
+
+def test_min_discharge_rejects_deadline_at_range_end():
+    # deadline 必须严格小于 forecast_to（范围终点不含）
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            arrivals=[{"time": 0, "vehicles": 1, "deadline": 60}],
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_min_discharge(req)
+    assert exc.value.status_code == 422
+
+
+def test_min_discharge_rejects_arrival_outside_range():
+    req = make_min_discharge_request(
+        min_discharge_payload(
+            arrivals=[{"time": 60, "vehicles": 1, "deadline": 60}],
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_min_discharge(req)
+    assert exc.value.status_code == 422
+
+
+def test_min_discharge_rejects_invalid_signal_and_range():
+    for field, value in (("offset", 60), ("green_start", 60), ("green_end", 60)):
+        req = make_min_discharge_request(min_discharge_payload(**{field: value}))
+        with pytest.raises(HTTPException) as exc:
+            green_wave_min_discharge(req)
+        assert exc.value.status_code == 422
+    req = make_min_discharge_request(
+        min_discharge_payload(forecast_from=10, forecast_to=10)
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_min_discharge(req)
+    assert exc.value.status_code == 422
+    req = make_min_discharge_request(min_discharge_payload(forecast_to=86401))
+    with pytest.raises(HTTPException) as exc:
+        green_wave_min_discharge(req)
+    assert exc.value.status_code == 422
+
+
+def test_min_discharge_rejects_bad_batch_fields():
+    with pytest.raises(ValidationError):
+        make_min_discharge_request(
+            min_discharge_payload(
+                arrivals=[{"time": 0, "vehicles": 0, "deadline": 1}]
+            )
+        )
+    with pytest.raises(ValidationError):
+        make_min_discharge_request(
+            min_discharge_payload(
+                forecast_to=2000,
+                arrivals=[
+                    {"time": i, "vehicles": 1, "deadline": i}
+                    for i in range(1001)
+                ],
+            )
+        )
+    with pytest.raises(ValidationError):
+        make_min_discharge_request(min_discharge_payload(initial_queue=-1))
+
+
+def test_min_discharge_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    path = "/api/green-wave/min-discharge"
+    assert path in paths
+    assert "post" in paths[path]
+    # 无解时响应体为 null（response_model 允许 None）
+    schema = app.openapi()
+    response = schema["paths"][path]["post"]["responses"]["200"]
+    ref = response["content"]["application/json"]["schema"]
+    assert {"type": "null"} in ref["anyOf"]
+    assert any("$ref" in item for item in ref["anyOf"])

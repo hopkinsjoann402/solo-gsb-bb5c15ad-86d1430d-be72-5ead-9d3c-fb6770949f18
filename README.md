@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供九个接口：
+提供十个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -69,6 +69,15 @@
    红灯不放行）；队列用**批次计数**推进，不逐辆展开。返回**各批最后一辆的通过秒**
    （范围内未全部通过为 `null`）、**期末待行车辆数**与**最大排队数**（每秒到达后、
    放行前统计）。
+10. **路口放行能力测算** `POST /api/green-wave/min-discharge`：复用排队预测的单路口
+    信号、半开预测范围、期初队列与批次到达语义，但不再给定每绿灯秒放行量而是反向
+    求解。每批除到达秒 `time` 与正整数车辆数 `vehicles` 外，另给**含端点**截止秒
+    `deadline`（`time <= deadline < forecast_to`）。服务通过**按批计数**的可行性模拟
+    （每秒先按输入顺序把当秒批次入队再判灯放行，红灯不放行，跨零点与常绿判灯规则
+    不变）与对放行量的**单调二分**，求使期初车辆及全部批次在范围结束前清空、且每批
+    最后一辆不晚于自身 `deadline` 通过的**最小正整数**每绿灯秒放行量，返回该最低放行量
+    及此值下按输入顺序的各批通过秒；同秒批次按输入顺序先入队再放行；无解（绿灯秒
+    不足、deadline 无法满足等）时响应体为 `null`。
 
 ## 目录结构
 
@@ -136,6 +145,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 班次重排 | `POST http://localhost:8000/api/green-wave/timetable-reschedule` |
 | 最早到达路径 | `POST http://localhost:8000/api/green-wave/earliest-route` |
 | 单路口排队预测 | `POST http://localhost:8000/api/green-wave/queue-forecast` |
+| 路口放行能力测算 | `POST http://localhost:8000/api/green-wave/min-discharge` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -1272,6 +1282,148 @@ curl -s -X POST http://localhost:8000/api/green-wave/queue-forecast \
    一个队首批次；全天范围、1000 批次的请求在毫秒级完成。测试含 2000 组随机参数
    下与**逐辆展开**暴力参考实现的逐项对照。
 
+## 路口放行能力测算
+
+`POST /api/green-wave/min-discharge` 是排队预测的"逆问题"：信号、范围、期初队列与
+批次到达都已确定，需要为路口配置多大的**每绿灯秒放行量**，才能保证期初车辆与全部
+批次在范围结束前清空、并且每一批都不晚于各自要求的时刻通过？信号相位
+（`(t+offset) mod cycle`、绿灯半开区间、跨周期零点、`green_start == green_end` 为
+整周期常绿）、半开预测范围 `[forecast_from, forecast_to)`、每秒"先入队当秒批次、再
+判灯放行、红灯不放行"、同秒批次按输入顺序入队等语义与
+[单路口排队预测](#单路口排队预测)**完全一致**；区别仅在于请求不传
+`discharge_per_second`，且每条到达批次额外携带一个**含端点**截止秒 `deadline`。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `forecast_from` | int | `>= 0`，预测范围起点（秒，含） |
+| `forecast_to` | int | `> forecast_from`，且 `forecast_to - forecast_from <= 86400` |
+| `cycle` | int | `1..86400`，信号周期 C（秒） |
+| `offset` | int | `0 <= offset < cycle`，相位偏移 |
+| `green_start` | int | `0 <= green_start < cycle`，绿灯起点（本地相位秒） |
+| `green_end` | int | `0 <= green_end < cycle`，绿灯终点（不含）；与 `green_start` 相等表示整周期常绿 |
+| `initial_queue` | int | `>= 0`，预测范围起点时已在排队等待的车辆数（不属于任何批次） |
+| `arrivals` | array | **0..1000** 条到达批次 |
+| `arrivals[].time` | int | 到达时刻（整数秒），必须落在 `[forecast_from, forecast_to)` 内，否则 422 |
+| `arrivals[].vehicles` | int | `>= 1`，该批到达的车辆数（正整数） |
+| `arrivals[].deadline` | int | 该批最后一辆允许通过的最晚秒（**含端点**），必须满足 `time <= deadline < forecast_to`，否则 422 |
+
+求满足以下条件的**最小正整数**每绿灯秒放行量 `d`：
+
+- 期初车辆与全部批次在范围结束前清空（最后通过秒严格小于 `forecast_to`）；
+- 每批最后一辆的通过秒不晚于其自身 `deadline`——通过秒恰等于 `deadline` 仍可行
+  （含端点）；
+- 放行仍只发生在绿灯秒、每秒至多 `d` 辆、按先到先走；同秒多批按输入顺序先入队再
+  放行，故先入队的批次会优先占用当秒绿灯容量。
+
+无解（例如范围内绿灯秒总数不足以清空车辆、某批到达后到 deadline 之间没有足够绿灯
+容量）时响应体为 JSON `null`（HTTP 状态码仍为 200）。无解属于业务结果而非请求错误，
+非法的 `deadline`（早于到达秒、或不小于范围终点）才返回 422。
+
+成功响应：
+
+```json
+{
+  "min_discharge_per_second": 2,
+  "batch_pass_times": [6, 7]
+}
+```
+
+- `min_discharge_per_second`：满足清空与全部 deadline 的最小正整数每绿灯秒放行量；
+- `batch_pass_times`：取该最小放行量时，各批最后一辆车的通过秒（与 `arrivals`
+  一一对应、按输入顺序），每个均不晚于对应 `deadline` 且严格小于 `forecast_to`。
+
+无任何车辆（期初队列与批次均为 0）时最小正整数放行量为 `1`，`batch_pass_times` 为
+空数组 `[]`。
+
+### 示例 1：deadline 决定最低放行量
+
+常绿路口、范围 `[0,60)`，期初无排队；`t=0` 到达 4 辆，`deadline=1`。每秒放行 1 辆时
+最后一辆 `t=3` 通过、晚于 deadline；每秒放行 2 辆时 `t=0、1` 恰走完，最后一辆通过秒
+恰为 deadline（含端点），故最低放行量为 2：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/min-discharge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "forecast_from": 0,
+    "forecast_to": 60,
+    "cycle": 60,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 0,
+    "initial_queue": 0,
+    "arrivals": [{"time": 0, "vehicles": 4, "deadline": 1}]
+  }'
+# {"min_discharge_per_second":2,"batch_pass_times":[1]}
+```
+
+### 示例 2：红灯积压、绿灯秒不足时无解
+
+周期 60 秒、绿灯 `[0,10)`，`t=20` 到达的批次在范围 `[0,60)` 内一直遇红，无论放行量
+多大都无法通过，响应体为 `null`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/min-discharge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "forecast_from": 0,
+    "forecast_to": 60,
+    "cycle": 60,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 10,
+    "initial_queue": 0,
+    "arrivals": [{"time": 20, "vehicles": 3, "deadline": 59}]
+  }'
+# null
+```
+
+### 示例 3：同秒批次按输入顺序共享绿灯容量
+
+常绿路口、范围 `[0,10)`，`t=0` 同秒到达两批（2 辆与 1 辆，按输入顺序入队），第二批
+要求 `deadline=1`。每秒放行 1 辆时第二批 `t=2` 才通过、违约；每秒放行 2 辆时第一批
+`t=0` 走完、第二批 `t=1` 通过（恰为 deadline），最低放行量为 2；交换两批输入顺序会
+改变各自通过秒，因为绿灯容量按先到先走分配：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/min-discharge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "forecast_from": 0,
+    "forecast_to": 10,
+    "cycle": 60,
+    "offset": 0,
+    "green_start": 0,
+    "green_end": 0,
+    "initial_queue": 0,
+    "arrivals": [
+      {"time": 0, "vehicles": 2, "deadline": 9},
+      {"time": 0, "vehicles": 1, "deadline": 1}
+    ]
+  }'
+# {"min_discharge_per_second":2,"batch_pass_times":[0,1]}
+```
+
+### 放行能力测算的算法说明（按批计数可行性模拟 + 单调二分）
+
+1. **可行性对放行量单调**：放行量越大，每秒绿灯放行走的车只多不少，任何一辆车的通过
+   秒只可能提前，故"满足清空与全部 deadline"关于放行量单调，可在
+   `[1, 车辆总数]` 上**二分**最小可行值；`d = 车辆总数` 时任一绿灯秒即可清空全部
+   车辆（范围内没有任何绿灯秒时该上界也不可行，直接返回 `null`）。车辆总数为 0 时
+   最小正整数放行量为 1。
+2. **按批计数可行性模拟**：每次试算都执行与排队预测同构的逐秒模拟——先把当秒批次按
+   输入顺序整体入队，再判灯放行至多 `d` 辆（红灯不放行），队列以"批次下标 + 剩余
+   辆数"推进，**不逐辆展开**，单批 10^12 辆也只做常数次计数扣减。当秒放行后检查
+   `deadline` 恰为当秒的批次是否已通过（含端点：当秒通过即合格），范围结束时仍有待
+   行车辆则不可行。
+3. **空队列跳转**：队列清空且下一到达秒之前没有任何车辆，且未入队批次的 deadline
+   不早于其到达秒，故该区间不可能违约，模拟直接跳到下一到达秒，不逐秒空转。
+4. 二分共 `O(log(车辆总数))` 次模拟，每次 `O(范围秒数 + 批次数)`（批量计数，与车辆
+   总数大小无关）；全天范围、1000 批次的请求在毫秒级完成。测试含 3000 组随机参数下
+   与**逐辆展开 + 逐放行量扫描**暴力参考实现（最低放行量与各批通过秒）的逐项对照。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -1375,6 +1527,19 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 { "detail": ["arrivals[0].time = 60 必须落在预测范围 [0, 60) 内"] }
 ```
 
+`/api/green-wave/min-discharge` 沿用排队预测接口的信号参数、预测范围与到达时刻 422
+校验（`cycle ∈ [1, 86400]`、`0 <= offset / green_start / green_end < cycle`、
+半开范围长度 1..86400、`initial_queue >= 0`、`arrivals[].vehicles >= 1`、批次数不
+超过 1000、每条批次 `time` 落在 `[forecast_from, forecast_to)` 内），并额外要求每条
+批次的 `deadline` 满足 **`time <= deadline < forecast_to`**：`deadline` 早于该批到达
+秒，或不小于范围终点（终点不含），均为跨字段 422（错误信息带批次下标）。注意：
+deadline 合法但绿灯容量不足（含范围内全程红灯）属于业务结果，HTTP 状态码为 200、
+响应体为 `null`，不会返回 422。
+
+```json
+{ "detail": ["arrivals[0].deadline = 60 必须满足 time <= deadline < forecast_to（范围终点 60 不含）"] }
+```
+
 ## 算法说明（区间运算，不逐秒试探）
 
 1. **周期内展开与波动收缩**：每个路口的绿灯半开区间先展开为连续分量
@@ -1419,6 +1584,13 @@ HTTP 状态码为 200、响应体为 `null`（不会返回 422）。例如：
 先到先走放行至多 `discharge_per_second` 辆；队列用批次计数（队首为"批次下标 +
 剩余辆数"）推进，不逐辆展开，复杂度 `O(范围秒数 + 批次数)`。
 
+`/api/green-wave/min-discharge` 复用同一套按批计数逐秒模拟作为可行性判定（当秒批次
+先入队再判灯放行、红灯不放行、含端点 deadline 在当秒放行后检查、空队列直接跳到下一
+到达秒），外层对每绿灯秒放行量在 `[1, 车辆总数]` 上做单调二分——可行性随放行量单调
+不减，上界"车辆总数"在任一个绿灯秒即可清空，范围内无绿灯秒则该上界不可行、返回
+`null`；复杂度 `O(log(车辆总数) × (范围秒数 + 批次数))`，模拟本身与车辆总数大小
+无关。
+
 ## 运行测试
 
 ```bash
@@ -1452,4 +1624,10 @@ pytest -q
 另有 2000 组随机参数下与逐辆展开暴力参考实现的逐项对照，并覆盖红灯不放行、
 同秒多批按输入顺序入队、期初队列、跨零点绿灯、常绿、offset 相位、半开绿灯
 端点、批内部分通过（返回 `null`）、最大排队数在到达后放行前统计、全天范围
-1000 批次、超大车辆数（不逐辆展开）及范围外到达、无效信号参数等 422 校验场景。
+1000 批次、超大车辆数（不逐辆展开）及范围外到达、无效信号参数等 422 校验场景；
+路口放行能力测算
+另有 3000 组随机参数下与逐辆展开 + 逐放行量扫描暴力参考实现（最低放行量与各批
+通过秒）的逐项对照，并覆盖 deadline 含端点、红灯容量不足无解、同秒批次按输入
+顺序共享绿灯容量、期初队列阻挡、跨零点绿灯与 offset 相位、范围终点不含、无车辆
+返回放行量 1、超大车辆数（不逐辆展开）及 `deadline` 早于到达秒或不小于范围
+终点等 422 校验场景。

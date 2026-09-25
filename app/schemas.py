@@ -641,3 +641,107 @@ class QueueForecastResponse(BaseModel):
         ..., ge=0,
         description="预测范围内的最大排队车辆数（每秒到达批次入队后、放行前统计）",
     )
+
+
+# ---------- 路口放行能力测算 ----------
+
+
+class DeadlineArrivalBatch(ArrivalBatch):
+    """一条带含端点截止时刻的到达批次：继承 time / vehicles，另给 deadline。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    deadline: int = Field(
+        ...,
+        description=(
+            "该批最后一辆车允许通过的最晚秒（含端点）；须满足 "
+            "time <= deadline < forecast_to"
+        ),
+    )
+
+
+class MinDischargeRequest(BaseModel):
+    """路口放行能力测算请求（复用排队预测的单路口信号、范围与批次语义）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    forecast_from: int = Field(
+        ..., ge=0, description="预测范围起点（秒，含）"
+    )
+    forecast_to: int = Field(
+        ..., ge=1, description="预测范围终点（秒，不含）；范围长度 1..86400"
+    )
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    offset: int = Field(..., ge=0, description="相位偏移 o（秒），需满足 0 <= o < C")
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= g_start < C"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= g_end < C"
+    )
+    initial_queue: int = Field(
+        ..., ge=0, description="预测范围起点时已在排队等待的车辆数（非负整数）"
+    )
+    arrivals: list[DeadlineArrivalBatch] = Field(
+        ..., max_length=MAX_ARRIVAL_BATCHES,
+        description=(
+            "到达批次列表，0..1000 条；每条含 time（到达秒）、vehicles（正整数"
+            "车辆数）与 deadline（含端点截止秒，time <= deadline < forecast_to）；"
+            "同一秒可多批，按输入顺序先入队再放行"
+        ),
+    )
+
+    def validate_ranges(self) -> None:
+        """跨字段校验：范围长度、相位上界、到达时刻与 deadline；非法时抛 HTTP 422。"""
+        errors: list[str] = []
+        length = self.forecast_to - self.forecast_from
+        if length <= 0:
+            errors.append("forecast_to 必须大于 forecast_from（半开预测范围）")
+        elif length > MAX_QUEUE_FORECAST_SECONDS:
+            errors.append("预测范围长度不得超过 86400 秒")
+        if not 0 <= self.offset < self.cycle:
+            errors.append("offset 必须满足 0 <= offset < cycle")
+        if not 0 <= self.green_start < self.cycle:
+            errors.append("green_start 必须满足 0 <= green_start < cycle")
+        if not 0 <= self.green_end < self.cycle:
+            errors.append("green_end 必须满足 0 <= green_end < cycle")
+        for index, batch in enumerate(self.arrivals):
+            if not self.forecast_from <= batch.time < self.forecast_to:
+                errors.append(
+                    f"arrivals[{index}].time = {batch.time} 必须落在预测范围 "
+                    f"[{self.forecast_from}, {self.forecast_to}) 内"
+                )
+            if batch.deadline < batch.time:
+                errors.append(
+                    f"arrivals[{index}].deadline = {batch.deadline} 不得早于该批 "
+                    f"到达秒 time = {batch.time}（含端点截止）"
+                )
+            if not self.forecast_from <= batch.deadline < self.forecast_to:
+                errors.append(
+                    f"arrivals[{index}].deadline = {batch.deadline} 必须满足 "
+                    f"time <= deadline < forecast_to（范围终点 "
+                    f"{self.forecast_to} 不含）"
+                )
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class MinDischargeResponse(BaseModel):
+    """放行能力测算结果：最小正整数绿灯秒放行量及该值下各批通过秒。"""
+
+    min_discharge_per_second: int = Field(
+        ..., ge=1,
+        description=(
+            "使期初车辆与全部批次在范围结束前清空、且每批最后一辆不晚于自身 "
+            "deadline 通过的最小正整数每绿灯秒放行量"
+        ),
+    )
+    batch_pass_times: list[int] = Field(
+        ...,
+        description=(
+            "取最小放行量时各批最后一辆车的通过秒（整数秒，与 arrivals 一一对应、"
+            "按输入顺序）；每批通过秒均不晚于其 deadline 且严格小于 forecast_to"
+        ),
+    )
